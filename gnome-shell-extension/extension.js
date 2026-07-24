@@ -42,6 +42,23 @@ const gazeTiming = (tag, extra) =>
     `GAZE_TIMING ${tag} t=${GLib.get_monotonic_time()}us${extra ? " " + extra : ""}`,
   );
 
+const recreatePolkitAgent = () => {
+  const manager = Main.componentManager;
+  if (!manager || Main.sessionMode.isLocked) return;
+
+  const existing = manager._allComponents?.["polkitAgent"];
+  if (existing?._currentDialog) {
+    try {
+      existing._currentDialog.close();
+    } catch (e) {}
+    existing._currentDialog = null;
+  }
+
+  manager._disableComponent("polkitAgent");
+  delete manager._allComponents["polkitAgent"];
+  manager._enableComponent("polkitAgent").catch(() => {});
+};
+
 const GENERIC_ERROR_MAP = new Map([
   [
     "Sorry, that did not work. Please try again.",
@@ -152,6 +169,7 @@ export default class GazeFaceAuthExtension extends Extension {
 
     const proto = Util.ShellUserVerifier.prototype;
     const extensionSettings = this._extensionSettings;
+    const extension = this;
 
     const getFaceEnabled = () =>
       extensionSettings.get_boolean(FACE_AUTHENTICATION_KEY);
@@ -240,8 +258,10 @@ export default class GazeFaceAuthExtension extends Extension {
 
           if (klass && !klass._gazeOverridden) {
             klass._gazeOverridden = true;
+            extension._patchedDialogClass = klass;
 
             const originalShowInfo = klass.prototype._onSessionShowInfo;
+            extension._originalDialogShowInfo = originalShowInfo;
             klass.prototype._onSessionShowInfo = function (session, text) {
               if (text && text.trim() === "GAZE_CONFIRMATION_REQUEST") {
                 gazeTiming("CONFIRM_SHOWN", "path=onSessionShowInfo");
@@ -269,6 +289,7 @@ export default class GazeFaceAuthExtension extends Extension {
 
             const originalProtoOnEntryActivate =
               klass.prototype._onEntryActivate;
+            extension._originalDialogEntryActivate = originalProtoOnEntryActivate;
             klass.prototype._onEntryActivate = function () {
               if (this._confirmMode) {
                 this._session.response("CONFIRM");
@@ -281,12 +302,7 @@ export default class GazeFaceAuthExtension extends Extension {
       },
     );
 
-    const manager = Main.componentManager;
-    if (manager) {
-      manager._disableComponent("polkitAgent");
-      delete manager._allComponents["polkitAgent"];
-      manager._enableComponent("polkitAgent").catch((e) => {});
-    }
+    recreatePolkitAgent();
 
     this._injectionManager.overrideMethod(
       proto,
@@ -609,11 +625,18 @@ export default class GazeFaceAuthExtension extends Extension {
     this._injectionManager = null;
     this._extensionSettings = null;
 
-    const manager = Main.componentManager;
-    if (manager) {
-      manager._disableComponent("polkitAgent");
-      delete manager._allComponents["polkitAgent"];
-      manager._enableComponent("polkitAgent").catch((e) => {});
+    if (this._patchedDialogClass) {
+      const klass = this._patchedDialogClass;
+      if (this._originalDialogShowInfo)
+        klass.prototype._onSessionShowInfo = this._originalDialogShowInfo;
+      if (this._originalDialogEntryActivate)
+        klass.prototype._onEntryActivate = this._originalDialogEntryActivate;
+      delete klass._gazeOverridden;
+      this._patchedDialogClass = null;
+      this._originalDialogShowInfo = null;
+      this._originalDialogEntryActivate = null;
     }
+
+    recreatePolkitAgent();
   }
 }
