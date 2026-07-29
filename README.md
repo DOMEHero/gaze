@@ -152,6 +152,10 @@ Camera → Face Detection (SCRFD) → Alignment → Embedding (ArcFace) → Matc
 
 ```toml
 # /etc/gaze/config.toml
+[inference]
+execution_provider = "cpu" # cpu | openvino (requires an OpenVINO build)
+device = "cpu"             # cpu | gpu | npu
+
 [security]
 level = "medium"    # low | medium | high | maximum | custom
 
@@ -171,6 +175,12 @@ min_face_size_ratio = 0.25
 enabled = true
 threshold = 0.8
 ```
+
+OpenVINO selects its device at run time. An OpenVINO-enabled installation
+should use `execution_provider = "openvino"` and `device = "npu"` to select the
+Intel NPU. The same binary can select the Intel GPU by changing `device` to
+`"gpu"`. The released packages are CPU-only; OpenVINO requires building from
+source with `just build-rust-openvino`.
 
 See the [configuration guide](https://gaze.gundulabs.com/guide/configuration) for all options.
 
@@ -210,6 +220,9 @@ sudo apt install build-essential pkg-config clang libclang-dev \
 
 # Build
 just build-rust
+
+# Build with OpenVINO support (requires an OpenVINO-enabled system ONNX Runtime)
+just build-rust-openvino
 
 # Package
 just package <deb | rpm | archlinux>

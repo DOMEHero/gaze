@@ -15,6 +15,10 @@ dialog, so make sure the `polkit` package is installed.
 ## Default config
 
 ```toml
+[inference]
+execution_provider = "cpu"
+device = "cpu"
+
 [security]
 level = "medium"
 
@@ -53,6 +57,46 @@ packaged default changed, the new template is saved alongside it as
 dpkg keeps your file and asks before replacing it. Any option missing from
 your config uses its built-in default, so you don't need to merge new options
 after upgrading.
+
+## Select the inference device
+
+Gaze always loads its `.onnx` models through ONNX Runtime.
+
+The default uses the ONNX Runtime CPU execution provider:
+
+```toml
+[inference]
+execution_provider = "cpu"
+device = "cpu"
+```
+
+OpenVINO does not select a fixed device at build time. The same
+OpenVINO-enabled Gaze binary can use an Intel CPU, GPU, or NPU. Select the
+device in `/etc/gaze/config.toml`.
+
+An installation with OpenVINO support should select the Intel NPU by default:
+
+```toml
+[inference]
+execution_provider = "openvino"
+device = "npu"
+```
+
+Change `device` to `"gpu"` to use the Intel GPU. This does not require
+recompiling Gaze.
+
+The Gaze daemon must also be compiled with the `openvino` Cargo feature. On a
+CPU-only build, `gaze config` and the GUI refuse to set
+`execution_provider = "openvino"`. A config file that already contains it does
+not stop the daemon: it logs a warning and runs on the CPU, the same way every
+other unusable value in `/etc/gaze/config.toml` is handled.
+
+The values stay lowercase in the config. Gaze converts the device name only
+when it calls OpenVINO. ONNX Runtime keeps its CPU execution provider after
+OpenVINO. It runs unsupported model operations on the CPU. If Gaze cannot
+create an OpenVINO session, it logs the error and creates a CPU session.
+`gaze doctor --benchmark` reports the execution provider and device each model
+actually uses, and warns when that is not the configured one.
 
 ## Change security level
 
