@@ -51,11 +51,10 @@ impl CameraFeed {
                 }
             };
 
-            for frame in &mut cam {
-                if stop_clone.load(Ordering::Relaxed) {
-                    break;
-                }
-
+            // Poll interruptibly: `stop_and_wait` joins this thread from the GTK
+            // main loop, and plain iteration would block there until a frame
+            // arrives (forever, on a stalled camera).
+            while let Some(frame) = cam.next_interruptible(&stop_clone) {
                 let Ok(bytes) = frame_to_bytes(&frame) else {
                     continue;
                 };
@@ -233,6 +232,18 @@ impl CameraFeed {
             thread::spawn(move || {
                 let _ = handle.join();
             });
+        }
+    }
+
+    /// Release the camera before another owner, such as `gazed`, opens it.
+    ///
+    /// This is only used after the user starts enrollment. A live preview has
+    /// already proven that frames are arriving, so joining normally completes
+    /// after at most one more frame.
+    pub fn stop_and_wait(&self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.thread_handle.borrow_mut().take() {
+            let _ = handle.join();
         }
     }
 

@@ -3,7 +3,8 @@
 
 use console::{Term, style};
 use gaze_core::config::{
-    CONFIG_PATH, Config, MAX_LIVENESS_THRESHOLD, MIN_LIVENESS_MAX_FRAMES, MIN_LIVENESS_THRESHOLD,
+    CONFIG_PATH, Config, MAX_LIVENESS_THRESHOLD, MAX_SECURITY_THRESHOLD, MIN_LIVENESS_MAX_FRAMES,
+    MIN_LIVENESS_THRESHOLD, MIN_SECURITY_THRESHOLD,
 };
 use gaze_core::dbus::{
     GazeProxy, dbus_error_message, dbus_is_file_not_found, dbus_is_not_activatable,
@@ -408,16 +409,20 @@ fn config_findings(config: &Config) -> Vec<Check> {
     }
 
     if config.security.level == "custom" {
-        if !config.security.threshold.is_finite()
-            || !(0.0..=1.0).contains(&config.security.threshold)
-        {
-            error(
-                format!(
-                    "security.threshold must be between 0.0 and 1.0, got {}",
-                    config.security.threshold
-                ),
-                "Set a valid custom threshold in /etc/gaze/config.toml.",
-            );
+        for (name, threshold) in [
+            ("rgb_threshold", config.security.rgb_threshold),
+            ("ir_threshold", config.security.ir_threshold),
+        ] {
+            if !threshold.is_finite()
+                || !(MIN_SECURITY_THRESHOLD..=MAX_SECURITY_THRESHOLD).contains(&threshold)
+            {
+                error(
+                    format!(
+                        "security.{name} must be between {MIN_SECURITY_THRESHOLD} and {MAX_SECURITY_THRESHOLD}, got {threshold}"
+                    ),
+                    "Set valid custom RGB and IR thresholds in /etc/gaze/config.toml.",
+                );
+            }
         }
         if !matches!(
             config.security.hybrid_policy.as_str(),
@@ -1608,7 +1613,8 @@ mod tests {
         config.security.level = "custom".to_string();
         config.security.detector = "standard".to_string();
         config.security.recognizer = "standard".to_string();
-        config.security.threshold = 1.5;
+        config.security.rgb_threshold = 1.5;
+        config.security.ir_threshold = -0.1;
         config.security.hybrid_policy = "sometimes".to_string();
         config.cameras.rgb = "/dev/videoX".to_string();
         config.enrollment.min_face_size_ratio = 0.05;
@@ -1623,7 +1629,12 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains("security.threshold"))
+                .any(|message| message.contains("security.rgb_threshold"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("security.ir_threshold"))
         );
         assert!(
             messages

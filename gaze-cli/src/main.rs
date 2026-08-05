@@ -268,6 +268,35 @@ fn ensure_configured_source_listed(options: &mut Vec<(String, String)>, configur
     options.push((format!("{configured} (configured)"), configured.to_string()));
 }
 
+fn prompt_security_threshold(
+    theme: &ColorfulTheme,
+    spectrum: &str,
+    default: f64,
+) -> anyhow::Result<f64> {
+    let value = Input::<String>::with_theme(theme)
+        .with_prompt(format!(
+            "Custom {spectrum} threshold ({MIN_SECURITY_THRESHOLD} - {MAX_SECURITY_THRESHOLD})"
+        ))
+        .default(default.to_string())
+        .validate_with(|input: &String| match input.trim().parse::<f64>() {
+            Ok(value)
+                if value.is_finite()
+                    && (MIN_SECURITY_THRESHOLD..=MAX_SECURITY_THRESHOLD).contains(&value) =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(format!(
+                "must be between {MIN_SECURITY_THRESHOLD} and {MAX_SECURITY_THRESHOLD}"
+            )),
+            Err(_) => Err("must be a number".to_string()),
+        })
+        .interact_text()?
+        .trim()
+        .parse::<f64>()
+        .unwrap_or(DEFAULT_SECURITY_THRESHOLD);
+    Ok(value)
+}
+
 async fn run_config_wizard(
     term: &Term,
     proxy: &GazeProxy<'_>,
@@ -289,12 +318,13 @@ async fn run_config_wizard(
     if let Some(level) = SecurityLevel::preset_from_index(selected) {
         config.security = level;
     } else {
-        let (old_detector, old_recognizer, old_threshold, old_hybrid_policy) =
+        let (old_detector, old_recognizer, old_rgb_threshold, old_ir_threshold, old_hybrid_policy) =
             if config.security.level == "custom" {
                 (
                     config.security.detector.clone(),
                     config.security.recognizer.clone(),
-                    config.security.threshold,
+                    config.security.rgb_threshold,
+                    config.security.ir_threshold,
                     config.security.hybrid_policy.clone(),
                 )
             } else {
@@ -302,7 +332,8 @@ async fn run_config_wizard(
                     config.security.effective_detector_quality().to_string(),
                     config.security.effective_recognizer_quality().to_string(),
                     // Presets carry an f32 threshold; round so the prompt shows 0.4, not 0.4000000059604645.
-                    (config.security.threshold() as f64 * 100.0).round() / 100.0,
+                    (config.security.rgb_threshold() as f64 * 100.0).round() / 100.0,
+                    (config.security.ir_threshold() as f64 * 100.0).round() / 100.0,
                     config.security.hybrid_policy().to_string(),
                 )
             };
@@ -321,28 +352,8 @@ async fn run_config_wizard(
             .interact()?;
         let recognizer = SecurityLevel::model_quality_from_index(selected_rec_idx).to_string();
 
-        let threshold = Input::<String>::with_theme(&theme)
-            .with_prompt(format!(
-                "Custom threshold ({} - {})",
-                MIN_SECURITY_THRESHOLD, MAX_SECURITY_THRESHOLD
-            ))
-            .default(old_threshold.to_string())
-            .validate_with(|input: &String| match input.trim().parse::<f64>() {
-                Ok(value)
-                    if value.is_finite()
-                        && (MIN_SECURITY_THRESHOLD..=MAX_SECURITY_THRESHOLD).contains(&value) =>
-                {
-                    Ok(())
-                }
-                Ok(_) => Err(format!(
-                    "must be between {MIN_SECURITY_THRESHOLD} and {MAX_SECURITY_THRESHOLD}"
-                )),
-                Err(_) => Err("must be a number".to_string()),
-            })
-            .interact_text()?
-            .trim()
-            .parse::<f64>()
-            .unwrap_or(DEFAULT_SECURITY_THRESHOLD);
+        let rgb_threshold = prompt_security_threshold(&theme, "RGB", old_rgb_threshold)?;
+        let ir_threshold = prompt_security_threshold(&theme, "IR", old_ir_threshold)?;
 
         let selected_hybrid_idx = Select::with_theme(&theme)
             .with_prompt("Custom hybrid combining policy")
@@ -351,7 +362,13 @@ async fn run_config_wizard(
             .interact()?;
         let hybrid_policy = SecurityLevel::hybrid_policy_from_index(selected_hybrid_idx);
 
-        config.security = SecurityLevel::custom(detector, recognizer, threshold, hybrid_policy);
+        config.security = SecurityLevel::custom_with_thresholds(
+            detector,
+            recognizer,
+            rgb_threshold,
+            ir_threshold,
+            hybrid_policy,
+        );
     };
 
     if config.inference.is_representable() {
@@ -736,6 +753,7 @@ async fn handle_auth(
 
     let mut status_stream = proxy.receive_verify_status().await?;
     let mut capture_stream = proxy.receive_face_status().await?;
+    let mut diagnostic_stream = proxy.receive_verify_diagnostic().await?;
     let mut terminal = if !silent {
         match TuiTerminal::new() {
             Ok(terminal) => Some(terminal),
@@ -762,6 +780,7 @@ async fn handle_auth(
     let mut tick = 0_u64;
     let mut cancelled = false;
     let mut verify_result = None;
+    let mut diagnostics = Vec::new();
 
     loop {
         if let Some(ref mut terminal) = terminal {
@@ -798,6 +817,12 @@ async fn handle_auth(
                     };
                 }
             }
+            signal = diagnostic_stream.next(), if verbose => {
+                let Some(signal) = signal else { break };
+                if let Ok(args) = signal.args() {
+                    diagnostics.push(args.message().to_string());
+                }
+            }
             _ = tokio::time::sleep(Duration::from_millis(80)) => {
                 tick = tick.wrapping_add(1);
             }
@@ -805,6 +830,16 @@ async fn handle_auth(
     }
 
     drop(terminal);
+
+    if verbose {
+        while let Ok(Some(signal)) =
+            tokio::time::timeout(Duration::from_millis(20), diagnostic_stream.next()).await
+        {
+            if let Ok(args) = signal.args() {
+                diagnostics.push(args.message().to_string());
+            }
+        }
+    }
 
     if cancelled {
         let _ = proxy.verify_stop().await;
@@ -815,6 +850,12 @@ async fn handle_auth(
     let mut authenticated = false;
     if let Some((result, faces, rgb_status, ir_status)) = verify_result {
         if verbose {
+            for message in &diagnostics {
+                println!("{message}");
+            }
+            if !diagnostics.is_empty() {
+                println!();
+            }
             println!(
                 "\n{:<20} {:>10} {:>8} {:>8} {:>10} {:>8} {:>8}",
                 style("Face").bold(),
@@ -1575,8 +1616,13 @@ async fn run() -> anyhow::Result<()> {
                 );
                 println!(
                     "{} {:.2}",
-                    style("security.threshold:").bold(),
-                    config.security.threshold()
+                    style("security.rgb_threshold:").bold(),
+                    config.security.rgb_threshold()
+                );
+                println!(
+                    "{} {:.2}",
+                    style("security.ir_threshold:").bold(),
+                    config.security.ir_threshold()
                 );
                 println!(
                     "{} {}",

@@ -16,8 +16,19 @@ let
 
   # Merge user `settings` over the upstream default config.
   defaultSettings = builtins.fromTOML (builtins.readFile ../config/config.toml);
+  userSecuritySettings = cfg.settings.security or { };
+  legacySecurityThreshold = userSecuritySettings.threshold or null;
+  normalizedSecuritySettings =
+    (removeAttrs userSecuritySettings [ "threshold" ])
+    // lib.optionalAttrs (legacySecurityThreshold != null) {
+      rgb_threshold = userSecuritySettings.rgb_threshold or legacySecurityThreshold;
+      ir_threshold = userSecuritySettings.ir_threshold or legacySecurityThreshold;
+    };
+  normalizedSettings = cfg.settings // lib.optionalAttrs (cfg.settings ? security) {
+    security = normalizedSecuritySettings;
+  };
   configFile = settingsFormat.generate "gaze-config.toml" (
-    lib.recursiveUpdate defaultSettings cfg.settings
+    lib.recursiveUpdate defaultSettings normalizedSettings
   );
 
   pamModuleFor =
