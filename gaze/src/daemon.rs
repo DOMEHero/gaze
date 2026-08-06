@@ -63,6 +63,31 @@ fn claim_has_epoch(state: &Option<ClaimState>, epoch: u64) -> bool {
     matches!(state, Some(claim) if claim.epoch == epoch)
 }
 
+/// Whether a NameOwnerChanged signal says `watched` lost its owner. A `new_owner`
+/// means the name was acquired or handed on, not that the client went away.
+fn is_vanish_of(name: &str, new_owner: Option<&str>, watched: &str) -> bool {
+    name == watched && new_owner.is_none()
+}
+
+/// Drop the claim identified by `epoch`, cancel its task, and report whether this call
+/// is what dropped it. Epochs are unique per claim; unique names are not.
+async fn release_claim_epoch(
+    claim_state: &Arc<Mutex<Option<ClaimState>>>,
+    active_cancel: &Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    epoch: u64,
+) -> bool {
+    let mut state = claim_state.lock().await;
+    if !claim_has_epoch(&state, epoch) {
+        return false;
+    }
+    *state = None;
+    let mut cancel = active_cancel.lock().await;
+    if let Some(tx) = cancel.take() {
+        let _ = tx.send(());
+    }
+    true
+}
+
 pub struct FaceData {
     pub embedding: Array1<f32>,
     pub liveness_frame: Option<Mat>,
@@ -589,10 +614,14 @@ impl AuthDaemon {
 mod tests {
     use super::{
         AuthDaemon, ClaimState, and_policy_unsatisfiable, auth_streams, claim_has_epoch,
-        eyes_from_kpss, hybrid_auth_passed, pipewire_runtime_update, should_yield_rgb_to_ir,
+        eyes_from_kpss, hybrid_auth_passed, is_vanish_of, pipewire_runtime_update,
+        release_claim_epoch, should_yield_rgb_to_ir,
     };
     use gaze_core::config::AuthSurface;
     use gaze_core::dbus::{ActiveSession, CaptureStatus};
+    use std::sync::Arc;
+    use tokio::sync::oneshot::error::TryRecvError;
+    use tokio::sync::{Mutex, oneshot};
 
     fn session(class: &str) -> ActiveSession {
         ActiveSession {
@@ -690,6 +719,120 @@ mod tests {
 
         assert!(!claim_has_epoch(&state, 1));
         assert!(claim_has_epoch(&state, 2));
+    }
+
+    fn claim_at(epoch: u64) -> Arc<Mutex<Option<ClaimState>>> {
+        Arc::new(Mutex::new(Some(ClaimState {
+            username: "alice".to_string(),
+            sender: ":1.42".to_string(),
+            epoch,
+        })))
+    }
+
+    // The vanish watcher, the owner re-check, and the claim timeout all release here.
+    #[tokio::test]
+    async fn release_clears_and_cancels() {
+        let claim_state = claim_at(7);
+        let (tx, mut rx) = oneshot::channel();
+        let active_cancel = Arc::new(Mutex::new(Some(tx)));
+
+        assert!(release_claim_epoch(&claim_state, &active_cancel, 7).await);
+        assert!(claim_state.lock().await.is_none());
+        assert!(rx.try_recv().is_ok(), "the active task must be cancelled");
+    }
+
+    // A watcher spawned for an earlier claim must not revoke the one that replaced it.
+    #[tokio::test]
+    async fn stale_epoch_spares_newer_claim() {
+        let claim_state = claim_at(8);
+        let (tx, mut rx) = oneshot::channel();
+        let active_cancel = Arc::new(Mutex::new(Some(tx)));
+
+        assert!(!release_claim_epoch(&claim_state, &active_cancel, 7).await);
+        assert!(claim_has_epoch(&*claim_state.lock().await, 8));
+        // Empty, not just Err: a dropped sender also reports Err but leaves the newer
+        // claim's task uncancellable.
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "the newer claim's task must not be cancelled"
+        );
+    }
+
+    // The owner re-check and the signal handler can both fire for one claim.
+    #[tokio::test]
+    async fn double_release_is_idempotent() {
+        let claim_state = claim_at(9);
+        let (tx, _rx) = oneshot::channel();
+        let active_cancel = Arc::new(Mutex::new(Some(tx)));
+
+        assert!(release_claim_epoch(&claim_state, &active_cancel, 9).await);
+        assert!(!release_claim_epoch(&claim_state, &active_cancel, 9).await);
+        assert!(claim_state.lock().await.is_none());
+    }
+
+    // A claim held with no verification running still has to clear.
+    #[tokio::test]
+    async fn release_without_an_active_task_still_clears() {
+        let claim_state = claim_at(3);
+        let active_cancel = Arc::new(Mutex::new(None));
+
+        assert!(release_claim_epoch(&claim_state, &active_cancel, 3).await);
+        assert!(claim_state.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn release_on_an_unclaimed_daemon_is_a_noop() {
+        let claim_state = Arc::new(Mutex::new(None));
+        let (tx, mut rx) = oneshot::channel();
+        let active_cancel = Arc::new(Mutex::new(Some(tx)));
+
+        assert!(!release_claim_epoch(&claim_state, &active_cancel, 1).await);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    // The case the epoch guard exists for: one connection claims, releases, and claims
+    // again, so the same unique name backs two different claims.
+    #[tokio::test]
+    async fn same_sender_reclaiming_is_not_released_by_the_old_epoch() {
+        let claim_state = claim_at(11);
+        let active_cancel = Arc::new(Mutex::new(None));
+
+        assert!(release_claim_epoch(&claim_state, &active_cancel, 11).await);
+        *claim_state.lock().await = Some(ClaimState {
+            username: "alice".to_string(),
+            sender: ":1.42".to_string(),
+            epoch: 12,
+        });
+
+        assert!(!release_claim_epoch(&claim_state, &active_cancel, 11).await);
+        assert!(claim_has_epoch(&*claim_state.lock().await, 12));
+    }
+
+    // The re-check and the vanish signal race by design; exactly one may win.
+    #[tokio::test]
+    async fn concurrent_releases_elect_a_single_winner() {
+        let claim_state = claim_at(4);
+        let (tx, mut rx) = oneshot::channel();
+        let active_cancel = Arc::new(Mutex::new(Some(tx)));
+
+        let (a, b) = tokio::join!(
+            release_claim_epoch(&claim_state, &active_cancel, 4),
+            release_claim_epoch(&claim_state, &active_cancel, 4)
+        );
+
+        assert!(a ^ b, "exactly one caller must report the release");
+        assert!(claim_state.lock().await.is_none());
+        assert!(rx.try_recv().is_ok(), "the active task must be cancelled");
+    }
+
+    #[test]
+    fn vanish_needs_the_watched_name_and_no_new_owner() {
+        assert!(is_vanish_of(":1.42", None, ":1.42"));
+        // An acquisition or hand-off is not a disappearance.
+        assert!(!is_vanish_of(":1.42", Some(":1.42"), ":1.42"));
+        assert!(!is_vanish_of(":1.99", None, ":1.42"));
+        // Prefix collision: ":1.4" vanishing must not release ":1.42".
+        assert!(!is_vanish_of(":1.4", None, ":1.42"));
     }
 
     #[test]
@@ -1812,15 +1955,15 @@ impl AuthDaemon {
         let claim_state = self.claim_state.clone();
         let active_cancel = self.active_cancel.clone();
 
+        let timeout_sender = sender.clone();
         self.rt_handle.spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(CLAIM_TIMEOUT_SECS)).await;
-            let mut state = claim_state.lock().await;
-            if claim_has_epoch(&state, epoch) {
-                *state = None;
-                let mut cancel = active_cancel.lock().await;
-                if let Some(tx) = cancel.take() {
-                    let _ = tx.send(());
-                }
+            if release_claim_epoch(&claim_state, &active_cancel, epoch).await {
+                warn!(
+                    sender = %timeout_sender,
+                    timeout_secs = CLAIM_TIMEOUT_SECS,
+                    "Claim timed out and was reclaimed; the client never released it"
+                );
             }
         });
 
@@ -1830,32 +1973,74 @@ impl AuthDaemon {
         let sender_for_watcher = sender.clone();
 
         self.rt_handle.spawn(async move {
-            let Ok(dbus) = fdo::DBusProxy::new(&conn).await else {
-                return;
+            let dbus = match fdo::DBusProxy::new(&conn).await {
+                Ok(dbus) => dbus,
+                Err(e) => {
+                    warn!(
+                        sender = %sender_for_watcher,
+                        error = %e,
+                        "No DBus proxy for the claim owner watcher; this claim will hold \
+                         until it times out"
+                    );
+                    return;
+                }
             };
 
-            let Ok(mut stream) = dbus.receive_name_owner_changed().await else {
-                return;
+            let mut stream = match dbus.receive_name_owner_changed().await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    warn!(
+                        sender = %sender_for_watcher,
+                        error = %e,
+                        "Could not watch the claim owner; this claim will hold until it \
+                         times out"
+                    );
+                    return;
+                }
             };
+
+            // The match rule only exists once the subscribe above resolves, so a sender
+            // that vanished during setup produces no signal at all. Re-check the owner
+            // now that the stream is live: between the two there is no gap.
+            match BusName::try_from(sender_for_watcher.clone()) {
+                Ok(watched) => match dbus.name_has_owner(watched).await {
+                    Ok(false) => {
+                        if release_claim_epoch(&claim_state, &active_cancel, epoch).await {
+                            info!(
+                                sender = %sender_for_watcher,
+                                "Sender vanished before the watcher subscribed, auto-releasing claim"
+                            );
+                        }
+                        return;
+                    }
+                    Ok(true) => {}
+                    Err(e) => warn!(
+                        sender = %sender_for_watcher,
+                        error = %e,
+                        "Could not re-check the claim owner; a sender that vanished during \
+                         setup will hold the claim until it times out"
+                    ),
+                },
+                Err(e) => warn!(
+                    sender = %sender_for_watcher,
+                    error = %e,
+                    "Unparsable claim sender; skipping the owner re-check"
+                ),
+            }
 
             while let Some(signal) = stream.next().await {
                 if let Ok(args) = signal.args()
-                    && args.name().as_str() == sender_for_watcher
-                    && args.new_owner().is_none()
+                    && is_vanish_of(
+                        args.name().as_str(),
+                        args.new_owner().as_ref().map(|o| o.as_str()),
+                        &sender_for_watcher,
+                    )
                 {
-                    info!(
-                        sender = %sender_for_watcher,
-                        "Sender vanished, auto-releasing claim"
-                    );
-                    let mut state = claim_state.lock().await;
-                    if let Some(claim) = &*state
-                        && claim.sender == sender_for_watcher
-                    {
-                        *state = None;
-                        let mut cancel = active_cancel.lock().await;
-                        if let Some(tx) = cancel.take() {
-                            let _ = tx.send(());
-                        }
+                    if release_claim_epoch(&claim_state, &active_cancel, epoch).await {
+                        info!(
+                            sender = %sender_for_watcher,
+                            "Sender vanished, auto-releasing claim"
+                        );
                     }
                     break;
                 }
